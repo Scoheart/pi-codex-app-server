@@ -16,6 +16,7 @@ import type { Thread } from "../../vendor/openai-codex-app-server-protocol/types
 import type { ThreadItem } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadItem.js";
 import type { ThreadLoadedListParams } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadLoadedListParams.js";
 import type { ThreadLoadedListResponse } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadLoadedListResponse.js";
+import type { ThreadSettingsUpdateParams } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadSettingsUpdateParams.js";
 import type { ThreadStartParams } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadStartParams.js";
 import type { ThreadStartResponse } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadStartResponse.js";
 import type { Turn } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/Turn.js";
@@ -45,6 +46,13 @@ import { acquireSessionLease } from "./session-owner.js";
 import { readPiPresence } from "./session-presence.js";
 import type { PiSessionRepository } from "./session-repository.js";
 import type { PiThreadCatalog } from "./thread-catalog.js";
+import {
+  applyThreadSettings,
+  pendingThreadSettings,
+  turnThreadSettings,
+  updateThreadSettings,
+} from "./thread-settings.js";
+import type { ThreadSettingsTarget } from "./thread-settings.js";
 import { persistTurnReceipt } from "./turn-receipt.js";
 
 const dataUrlSchema = z
@@ -58,15 +66,6 @@ const dataUrlSchema = z
       type: "image" as const,
     };
   });
-const thinkingLevelSchema = z.enum([
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-]);
 const loadedCursorSchema = z
   .string()
   .regex(/^pi-loaded:\d+$/u)
@@ -519,6 +518,97 @@ export class PiLiveSessionManager {
     }
   }
 
+  async updateSettings(params: ThreadSettingsUpdateParams): Promise<void> {
+    const { threadId } = params;
+    if (this.#starting.has(threadId)) {
+      throw new Error(`Pi thread command is already in progress: ${threadId}`);
+    }
+    this.#starting.add(threadId);
+    try {
+      const owner = await this.attachOwner(threadId);
+      if (owner) {
+        await owner.request({
+          id: randomUUID(),
+          method: "thread/settings/update",
+          params,
+        });
+        return;
+      }
+      let loaded = await this.resume(threadId);
+      if (loaded?.completion && !loaded.active) {
+        // A completed turn remains mapped until its asynchronous lease release finishes.
+        await loaded.completion;
+        loaded = await this.resume(threadId);
+      }
+      if (!loaded) {
+        throw new Error(`Thread not found: ${threadId}`);
+      }
+      try {
+        await updateThreadSettings(
+          params,
+          this.#settingsTarget(loaded.session),
+          !!loaded.active || loaded.session.isStreaming
+        );
+      } finally {
+        // New sessions have no JSONL file until their first prompt; retain those runtimes.
+        if (
+          loaded.release &&
+          !loaded.active &&
+          !loaded.session.isStreaming &&
+          loaded.session.sessionFile &&
+          existsSync(loaded.session.sessionFile)
+        ) {
+          loaded.session.dispose();
+          await PiLiveSessionManager.#releaseLease(loaded);
+          this.#loaded.delete(threadId);
+        }
+      }
+    } finally {
+      this.#starting.delete(threadId);
+    }
+  }
+
+  executionSettings(
+    threadId: string,
+    manager?: SessionManager
+  ):
+    | { model: string; modelProvider: string; reasoningEffort: string | null }
+    | undefined {
+    const session = this.#loaded.get(threadId)?.session;
+    const sessionManager = session?.sessionManager ?? manager;
+    if (!sessionManager) {
+      return undefined;
+    }
+    const context = sessionManager.buildSessionContext();
+    const pending = pendingThreadSettings(sessionManager.getBranch());
+    const provider =
+      session?.model?.provider ?? context.model?.provider ?? "pi";
+    const modelId = session?.model?.id ?? context.model?.modelId ?? "unknown";
+    const model =
+      pending.model ??
+      `${encodeURIComponent(provider)}/${encodeURIComponent(modelId)}`;
+    return {
+      model,
+      modelProvider: decodeURIComponent(model.slice(0, model.indexOf("/"))),
+      reasoningEffort:
+        pending.effort ?? session?.thinkingLevel ?? context.thinkingLevel,
+    };
+  }
+
+  #settingsTarget(session: AgentSession): ThreadSettingsTarget {
+    return {
+      append: (type, data) =>
+        session.sessionManager.appendCustomEntry(type, data),
+      cwd: session.sessionManager.getCwd(),
+      effort: session.thinkingLevel,
+      entries: session.sessionManager.getBranch(),
+      model: session.model,
+      resolve: (key) => this.#modelCatalog.resolve(key),
+      setEffort: (effort) => session.setThinkingLevel(effort),
+      setModel: (model) => session.setModel(model),
+    };
+  }
+
   async #startTurn(
     params: TurnStartParams,
     connection: JsonRpcConnection
@@ -558,18 +648,10 @@ export class PiLiveSessionManager {
     if (loaded.active || loaded.session.isStreaming) {
       throw new Error(`Thread is already running: ${params.threadId}`);
     }
-    const model = params.model
-      ? this.#modelCatalog.resolve(params.model)
-      : undefined;
-    if (params.model && !model) {
-      throw new Error(`Unknown Pi model: ${params.model}`);
-    }
-    if (model) {
-      await loaded.session.setModel(model);
-    }
-    if (params.effort) {
-      loaded.session.setThinkingLevel(thinkingLevelSchema.parse(params.effort));
-    }
+    await applyThreadSettings(
+      this.#settingsTarget(loaded.session),
+      turnThreadSettings(params)
+    );
     const turn = emptyTurn(params.rootTurnId);
     const active: ActiveTurn = {
       agentItems: new Map(),

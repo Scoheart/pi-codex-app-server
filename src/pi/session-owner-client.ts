@@ -34,15 +34,17 @@ export class SessionOwnerClient {
     }
   >();
   #closed = false;
+  readonly #protocolVersion: 1 | 2 | 3;
   readonly #ready: ReturnType<typeof Promise.withResolvers<undefined>> =
     Promise.withResolvers<undefined>();
   private constructor(
     socket: WebSocket,
     notify: (notification: ServerNotification) => void,
     closed: () => void,
-    protocolVersion: 1 | 2
+    protocolVersion: 1 | 2 | 3
   ) {
     this.#socket = socket;
+    this.#protocolVersion = protocolVersion;
     socket.on("message", (data) => {
       try {
         const packet = packetSchema.parse(JSON.parse(data.toString()));
@@ -251,6 +253,14 @@ export class SessionOwnerClient {
   async request(request: OwnerRequest): Promise<OwnerResult> {
     if (this.#closed) {
       throw new Error("Pi session owner is disconnected");
+    }
+    if (
+      request.method === "thread/settings/update" &&
+      this.#protocolVersion < 3
+    ) {
+      throw new Error(
+        "Pi TUI bridge needs an upgrade. Load the updated extension and run /reload before updating thread settings."
+      );
     }
     if (request.method === "turn/start" || request.method === "turn/steer") {
       assertSupportedPiInput(request.params.input);

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 
 import type {
   ExtensionAPI,
@@ -9,6 +10,7 @@ import type {
 import { z } from "zod";
 
 import type { ThreadItem } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadItem.js";
+import type { ThreadSettingsUpdateParams } from "../../vendor/openai-codex-app-server-protocol/typescript/v2/ThreadSettingsUpdateParams.js";
 import { findAcceptedTurn } from "../pi/accepted-turn.js";
 import { projectPiConversation } from "../pi/conversation-projector.js";
 import { images, textPrompt } from "../pi/live-session-manager.js";
@@ -20,8 +22,15 @@ import {
   notifyItemCompleted,
 } from "../pi/live-turn.js";
 import type { ActiveTurn } from "../pi/live-turn.js";
+import { PiModelCatalog } from "../pi/model-catalog.js";
 import { SessionOwnerHost } from "../pi/session-owner-host.js";
 import type { OwnerRequest, OwnerResult } from "../pi/session-owner.js";
+import {
+  applyThreadSettings,
+  turnThreadSettings,
+  updateThreadSettings,
+} from "../pi/thread-settings.js";
+import type { ThreadSettingsTarget } from "../pi/thread-settings.js";
 import { persistTurnReceipt } from "../pi/turn-receipt.js";
 import {
   parseServerNotification,
@@ -41,15 +50,9 @@ const userContentSchema = z.union([
     ])
   ),
 ]);
-const effortSchema = z.enum([
-  "off",
-  "minimal",
-  "low",
-  "medium",
-  "high",
-  "xhigh",
-  "max",
-]);
+interface HeldInput {
+  readonly action: "handled";
+}
 
 export class TuiSessionBridge {
   readonly #pi: ExtensionAPI;
@@ -60,6 +63,8 @@ export class TuiSessionBridge {
   #last?: ActiveTurn;
   #submittedPrompt?: string;
   #stopping = false;
+  #settingsBusy = false;
+  #settingsPreparation?: Promise<void>;
   #publishedName?: string;
   #clientMessageId: string | null = null;
   #skipUserMessages = 0;
@@ -87,21 +92,86 @@ export class TuiSessionBridge {
     await host.start();
     this.#host = host;
   }
-  guardInput(
+  async guardInput(
     event: InputEvent,
     context: ExtensionContext
-  ): { action: "handled" } | undefined {
+  ): Promise<HeldInput | undefined> {
+    const host = this.#host;
+    if (!host) {
+      return undefined;
+    }
+    if (this.#stopping) {
+      return TuiSessionBridge.#holdInput(
+        event,
+        context,
+        "Pi owner is stopping. Wait before sending another message."
+      );
+    }
+    if (this.#settingsBusy && context.isIdle()) {
+      return TuiSessionBridge.#holdInput(
+        event,
+        context,
+        "Remote settings are being prepared. Wait for them to finish before sending another message."
+      );
+    }
     if (
       this.#submittedPrompt === undefined ||
       !context.isIdle() ||
       (event.source === "extension" && event.text === this.#submittedPrompt)
     ) {
+      if (context.isIdle()) {
+        this.#settingsBusy = true;
+        const preparation = applyThreadSettings(this.#settingsTarget(context));
+        this.#settingsPreparation = preparation;
+        try {
+          await preparation;
+        } catch (error) {
+          context.ui.notify(
+            error instanceof Error
+              ? error.message
+              : "Pi settings could not be applied",
+            "error"
+          );
+          return { action: "handled" };
+        } finally {
+          if (this.#settingsPreparation === preparation) {
+            this.#settingsPreparation = undefined;
+            this.#settingsBusy = false;
+          }
+        }
+        if (this.#stopping || this.#host !== host) {
+          return { action: "handled" };
+        }
+      }
       return undefined;
     }
-    context.ui.notify(
-      "A remote message is being prepared. Wait for it to start before sending another message.",
-      "warning"
+    return TuiSessionBridge.#holdInput(
+      event,
+      context,
+      "A remote message is being prepared. Wait for it to start before sending another message."
     );
+  }
+  async beforeAgentStart(context: ExtensionContext): Promise<void> {
+    const host = this.#host;
+    if (!host) {
+      return;
+    }
+    try {
+      // All input handlers have finished; Pi has reserved the run, before inference starts.
+      await this.#settingsPreparation;
+    } catch {
+      context.abort();
+    }
+    if (this.#stopping || this.#host !== host) {
+      context.abort();
+    }
+  }
+  static #holdInput(
+    event: InputEvent,
+    context: ExtensionContext,
+    message: string
+  ): HeldInput {
+    context.ui.notify(message, "warning");
     if (event.source === "interactive") {
       context.ui.setEditorText(event.text);
     }
@@ -231,10 +301,22 @@ export class TuiSessionBridge {
       finishTurn(active);
     }
   }
-  async #command(request: OwnerRequest): Promise<OwnerResult> {
+  #commandContext(): ExtensionContext {
     const context = this.#context;
     if (!(context && this.#host) || this.#stopping) {
       throw new Error("Pi TUI owner is unavailable");
+    }
+    if (this.#settingsBusy) {
+      throw new Error(
+        "Pi thread settings are being prepared. Retry after they finish."
+      );
+    }
+    return context;
+  }
+  async #command(request: OwnerRequest): Promise<OwnerResult> {
+    const context = this.#commandContext();
+    if (request.method === "thread/settings/update") {
+      return await this.#updateSettings(request.params, context);
     }
     if (request.method === "thread/name/set") {
       this.#pi.setSessionName(request.params.name);
@@ -287,23 +369,12 @@ export class TuiSessionBridge {
     this.#submittedPrompt = textPrompt(request.params.input);
     try {
       const inputImages = await images(request.params.input);
-      if (request.params.model) {
-        const model = context.modelRegistry
-          .getAll()
-          .find(
-            (candidate) =>
-              `${encodeURIComponent(candidate.provider)}/${encodeURIComponent(candidate.id)}` ===
-              request.params.model
-          );
-        if (!model || !(await this.#pi.setModel(model))) {
-          throw new Error(`Pi model is unavailable: ${request.params.model}`);
-        }
-      }
+      await applyThreadSettings(
+        this.#settingsTarget(context),
+        turnThreadSettings(request.params)
+      );
       if (this.#stopping) {
         throw new Error("Pi session owner is shutting down");
-      }
-      if (request.params.effort) {
-        this.#pi.setThinkingLevel(effortSchema.parse(request.params.effort));
       }
       this.#clientMessageId = request.params.clientUserMessageId ?? null;
       this.#acceptanceTimer = setTimeout(() => {
@@ -331,6 +402,48 @@ export class TuiSessionBridge {
       finishTurn(active);
       throw error;
     }
+  }
+  async #updateSettings(
+    params: ThreadSettingsUpdateParams,
+    context: ExtensionContext
+  ): Promise<OwnerResult> {
+    this.#settingsBusy = true;
+    const preparation = updateThreadSettings(
+      params,
+      this.#settingsTarget(context),
+      !!this.#active || !context.isIdle()
+    );
+    this.#settingsPreparation = preparation;
+    try {
+      await preparation;
+      return {};
+    } finally {
+      if (this.#settingsPreparation === preparation) {
+        this.#settingsPreparation = undefined;
+        this.#settingsBusy = false;
+      }
+    }
+  }
+  #settingsTarget(context: ExtensionContext): ThreadSettingsTarget {
+    return {
+      append: (type, data) => this.#pi.appendEntry(type, data),
+      cwd: context.cwd,
+      effort: this.#pi.getThinkingLevel(),
+      entries: context.sessionManager.getBranch(),
+      model: context.model,
+      resolve: (key) =>
+        context.modelRegistry
+          .getAvailable()
+          .find((model) => PiModelCatalog.key(model) === key),
+      setEffort: (effort) => this.#pi.setThinkingLevel(effort),
+      setModel: async (model) => {
+        if (!(await this.#pi.setModel(model))) {
+          throw new Error(
+            `Pi model is unavailable: ${PiModelCatalog.key(model)}`
+          );
+        }
+      },
+    };
   }
   async #steer(
     request: Extract<OwnerRequest, { method: "turn/steer" }>,
@@ -372,6 +485,22 @@ export class TuiSessionBridge {
       this.#active.interrupted = true;
       finishTurn(this.#active);
       this.#context?.abort();
+    }
+    if (this.#context && !this.#context.isIdle()) {
+      this.#context.abort();
+    }
+    await this.#settingsPreparation?.catch(() => {
+      // The originating input or RPC handler reports this failure; shutdown still drains it.
+    });
+    const deadline = Date.now() + 15_000;
+    while (this.#context && !this.#context.isIdle()) {
+      if (Date.now() >= deadline) {
+        throw new Error(
+          "Pi is still stopping; its writer lease is retained. Retry once the session is idle."
+        );
+      }
+      // eslint-disable-next-line no-await-in-loop -- Observe actual SDK idle state, including failed preflight without agent_settled.
+      await delay(10);
     }
     await this.#host?.stop();
     this.#host = undefined;

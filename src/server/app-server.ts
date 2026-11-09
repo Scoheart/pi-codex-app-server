@@ -409,9 +409,13 @@ export class AppServer {
       this.#threadCatalog.publication?.retain(params.threadId, context.signal);
       this.#liveSessionManager.rebindConnection(params.threadId, connection);
       currentCwd = sessionManager.getCwd();
-      const sessionContext = sessionManager.buildSessionContext();
-      const provider = sessionContext.model?.provider ?? "pi";
-      const modelId = sessionContext.model?.modelId ?? "unknown";
+      const settings = this.#liveSessionManager.executionSettings(
+        params.threadId,
+        sessionManager
+      );
+      if (!settings) {
+        throw new Error(`Thread settings not found: ${params.threadId}`);
+      }
       return {
         activePermissionProfile: null,
         approvalPolicy: "never" as const,
@@ -420,10 +424,10 @@ export class AppServer {
         cwd: sessionManager.getCwd(),
         disabledPluginIds: [],
         instructionSources: [],
-        model: `${encodeURIComponent(provider)}/${encodeURIComponent(modelId)}`,
-        modelProvider: provider,
+        model: settings.model,
+        modelProvider: settings.modelProvider,
         multiAgentMode: "explicitRequestOnly" as const,
-        reasoningEffort: sessionContext.thinkingLevel,
+        reasoningEffort: settings.reasoningEffort,
         runtimeWorkspaceRoots: [sessionManager.getCwd()],
         sandbox: { type: "dangerFullAccess" as const },
         serviceTier: null,
@@ -434,6 +438,22 @@ export class AppServer {
       };
     };
     connection.registerRequest("thread/resume", resumeThread);
+    connection.registerRequest(
+      "thread/settings/update",
+      async (params, context) => {
+        await readThread({ threadId: params.threadId }, context);
+        await this.#liveSessionManager.updateSettings(params);
+        return {};
+      }
+    );
+    connection.registerRequest(
+      "thread/backgroundTerminals/list",
+      async (params, context) => {
+        await readThread({ threadId: params.threadId }, context);
+        // Pi bash calls belong to their live turn; Pi has no detached terminal registry.
+        return { data: [], nextCursor: null };
+      }
+    );
 
     connection.registerRequest("thread/fork", async (params, context) => {
       if (params.ephemeral) {
@@ -604,7 +624,7 @@ export class AppServer {
       return undefined;
     }
     await this.#threadCatalog.publication?.assertCanStart(pending.cwd);
-    return pending;
+    return { ...pending, ...this.#liveSessionManager.executionSettings(id) };
   }
 
   #trackPublication(connection: JsonRpcConnection, signal: AbortSignal): void {

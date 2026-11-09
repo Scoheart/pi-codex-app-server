@@ -30,9 +30,9 @@ const migrateError = (value: JsonValue | undefined): void => {
 // Migrate their 0.149 fields here, before strict validation against the public snapshot.
 export const migrateOwnerTurn = (
   value: JsonValue,
-  version: 1 | 2
+  version: 1 | 2 | 3
 ): JsonValue => {
-  if (version === 2) {
+  if (version !== 1) {
     return value;
   }
   const migrated = structuredClone(value);
@@ -51,9 +51,9 @@ export const migrateOwnerTurn = (
 
 export const migrateOwnerNotification = (
   value: JsonValue,
-  version: 1 | 2
+  version: 1 | 2 | 3
 ): JsonValue => {
-  if (version === 2) {
+  if (version !== 1) {
     return value;
   }
   const migrated = structuredClone(value);

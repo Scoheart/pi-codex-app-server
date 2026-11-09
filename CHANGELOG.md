@@ -2,6 +2,9 @@
 
 ## 0.3.0 (unreleased source fork)
 
+- Handle mobile settings-before-steer requests through the actual Pi writer, preserving active inference and persisting future model/reasoning defaults in Pi JSONL.
+- Return effective defaults on resume, require an updated TUI owner for settings, and provide an empty detached-terminal catalog for Pi.
+- Enforce current session publication policy before updating settings, including global/local opt-out and unknown session IDs.
 - Add the mobile folder picker command protocol: buffered/streamed output, stdin, PTY sizing, resize and termination.
 - Keep backpressured commands interruptible, preserve stdin close ordering, and clean up POSIX process groups after disconnects or timeouts.
 - Sanitize process-start errors so command arguments do not enter diagnostics.

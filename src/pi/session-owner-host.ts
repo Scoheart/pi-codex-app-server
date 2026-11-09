@@ -70,7 +70,7 @@ export class SessionOwnerHost {
         `${ownerPath(this.#home, this.#threadId)}.json.tmp`,
         JSON.stringify({
           pid: process.pid,
-          protocolVersion: 2,
+          protocolVersion: 3,
           threadId: this.#threadId,
           token,
           url: `ws://127.0.0.1:${address.port}`,
@@ -106,6 +106,7 @@ export class SessionOwnerHost {
         request.method !== "turn/steer" &&
         request.method !== "turn/interrupt" &&
         request.method !== "thread/compact/start" &&
+        request.method !== "thread/settings/update" &&
         request.method !== "thread/name/set"
       ) {
         throw new Error("Unsupported Pi owner operation");

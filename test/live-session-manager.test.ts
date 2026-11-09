@@ -108,6 +108,7 @@ const fixture = (home?: string) => {
   Object.defineProperties(session, {
     abort: { value: abort },
     isStreaming: { value: false },
+    model: { configurable: true, value: undefined },
     prompt: { value: prompt },
     sessionManager: { value: sessionManager },
     subscribe: {
@@ -117,6 +118,7 @@ const fixture = (home?: string) => {
         return unsubscribe;
       },
     },
+    thinkingLevel: { configurable: true, value: "off" },
   });
   mocks.createSession.mockResolvedValue({
     extensionsResult: {
@@ -449,6 +451,17 @@ describe("Pi live turn lifecycle", () => {
       model: { value: model },
       sessionFile: { value: undefined },
       sessionId: { value: f.sessionManager.getSessionId() },
+      setThinkingLevel: { value: () => {} },
+      steer: {
+        value: (text: string) => {
+          f.sessionManager.appendMessage({
+            content: text,
+            role: "user",
+            timestamp: 2,
+          });
+          return Promise.resolve();
+        },
+      },
       thinkingLevel: { value: "off" },
     });
     const server = new AppServer({
@@ -511,6 +524,40 @@ describe("Pi live turn lifecycle", () => {
               threadId,
             },
           });
+          yield JSON.stringify({
+            id: 7,
+            method: "thread/settings/update",
+            params: {
+              approvalPolicy: "never",
+              effort: "off",
+              model: "test/test",
+              threadId,
+            },
+          });
+          const active = output.find(
+            (message) => message.method === "turn/started"
+          );
+          const notification = active
+            ? parseServerNotification(active)
+            : undefined;
+          const turnId =
+            notification?.method === "turn/started"
+              ? notification.params.turn.id
+              : undefined;
+          yield JSON.stringify({
+            id: 8,
+            method: "turn/steer",
+            params: {
+              expectedTurnId: turnId,
+              input: [{ text: "steer", text_elements: [], type: "text" }],
+              threadId,
+            },
+          });
+          yield JSON.stringify({
+            id: 9,
+            method: "thread/backgroundTerminals/list",
+            params: { threadId },
+          });
           f.completion.resolve();
           await vi.waitFor(() =>
             expect(output).toContainEqual(
@@ -536,11 +583,21 @@ describe("Pi live turn lifecycle", () => {
     });
     server.register(connection);
     await connection.run();
-    for (const id of [1, 2, 3, 4, 5]) {
+    for (const id of [1, 2, 3, 4, 5, 7, 8]) {
       expect(output).toContainEqual(
         expect.objectContaining({ id, result: expect.anything() })
       );
     }
+    expect(output).toContainEqual({
+      id: 9,
+      result: { data: [], nextCursor: null },
+    });
+    expect(f.sessionManager.getBranch()).toContainEqual(
+      expect.objectContaining({
+        message: expect.objectContaining({ content: "steer", role: "user" }),
+        type: "message",
+      })
+    );
     expect(output).toContainEqual({
       id: 6,
       result: { data: [], nextCursor: null },
@@ -570,6 +627,84 @@ describe("Pi live turn lifecycle", () => {
       const release = await f.manager.deletionLease("thread");
       await release();
       expect(f.manager.loadedList({}).data).toStrictEqual([]);
+    } finally {
+      f.manager.close();
+      await rm(home, { force: true, recursive: true });
+    }
+  });
+
+  it("waits for turn cleanup before acquiring a settings writer", async () => {
+    const home = await mkdtemp(path.join(tmpdir(), "pi-settings-cleanup-"));
+    const f = fixture(home);
+    const disposed = Promise.withResolvers<undefined>();
+    const model = {
+      api: "openai-responses",
+      baseUrl: "https://example.invalid",
+      contextWindow: 1000,
+      cost: { cacheRead: 0, cacheWrite: 0, input: 0, output: 0 },
+      id: "next",
+      input: ["text"],
+      maxTokens: 1000,
+      name: "Next",
+      provider: "test",
+      reasoning: false,
+    } as const;
+    const noOwner = await f.manager.attachOwner("thread");
+    vi.spyOn(f.manager, "attachOwner").mockResolvedValue(noOwner);
+    vi.spyOn(f.modelCatalog, "resolve").mockReturnValue({
+      ...model,
+      input: ["text"],
+    });
+    Object.defineProperties(f.session, {
+      dispose: { value: () => disposed.resolve() },
+      setModel: {
+        value: () =>
+          Promise.reject(
+            new Error("Disposed Pi runtime must not write settings")
+          ),
+      },
+    });
+    const nextSession: AgentSession = Object.create(AgentSession.prototype);
+    let selected: AgentSession["model"];
+    Object.defineProperties(nextSession, {
+      dispose: { value: () => {} },
+      isStreaming: { value: false },
+      model: { get: () => selected },
+      sessionFile: { value: undefined },
+      sessionManager: { value: f.sessionManager },
+      setModel: {
+        value: (value: NonNullable<AgentSession["model"]>) => {
+          selected = value;
+          f.sessionManager.appendModelChange(value.provider, value.id);
+          return Promise.resolve();
+        },
+      },
+      thinkingLevel: { value: "off" },
+    });
+    try {
+      await f.manager.startTurn(
+        { input: [], threadId: "thread" },
+        f.connection
+      );
+      mocks.createSession.mockResolvedValue({
+        extensionsResult: {
+          errors: [],
+          extensions: [],
+          runtime: createExtensionRuntime(),
+        },
+        session: nextSession,
+      });
+      f.completion.resolve();
+      await disposed.promise;
+      await expect(
+        f.manager.updateSettings({ model: "test/next", threadId: "thread" })
+      ).resolves.toBeUndefined();
+      expect(f.sessionManager.buildSessionContext().model).toStrictEqual({
+        modelId: "next",
+        provider: "test",
+      });
+      const release = await f.manager.deletionLease("thread");
+      await release();
     } finally {
       f.manager.close();
       await rm(home, { force: true, recursive: true });

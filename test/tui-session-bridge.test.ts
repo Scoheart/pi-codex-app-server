@@ -1,7 +1,11 @@
 import { once } from "node:events";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import {
+  setImmediate as nextTick,
+  setTimeout as delay,
+} from "node:timers/promises";
 
 import { createAssistantMessageEventStream } from "@earendil-works/pi-ai";
 import type {
@@ -47,7 +51,10 @@ const response = (): AssistantMessage => ({
     totalTokens: 2,
   },
 });
-const fixture = async (persistent = false) => {
+const fixture = async (
+  persistent = false,
+  laterInput?: () => Promise<void>
+) => {
   const home = await mkdtemp(path.join(tmpdir(), "pi-owner-test-"));
   cleanup.push(() => rm(home, { force: true, recursive: true }));
   const modelRuntime = await ModelRuntime.create({
@@ -73,6 +80,10 @@ const fixture = async (persistent = false) => {
           await bridge?.start(ctx);
         });
         pi.on("input", (event, ctx) => bridge?.guardInput(event, ctx));
+        pi.on("input", () => laterInput?.());
+        pi.on("before_agent_start", (_event, ctx) =>
+          bridge?.beforeAgentStart(ctx)
+        );
         pi.on("agent_start", (event) => bridge?.event(event));
         pi.on("message_start", (event) => bridge?.event(event));
         pi.on("message_update", (event) => bridge?.event(event));
@@ -144,7 +155,16 @@ const fixture = async (persistent = false) => {
       return Promise.resolve();
     });
   }
-  return { bridge, clients, context, events, home, session, streams };
+  return {
+    bridge,
+    clients,
+    context,
+    events,
+    home,
+    modelRuntime,
+    session,
+    streams,
+  };
 };
 const streamText = (
   stream: AssistantMessageEventStream,
@@ -452,6 +472,25 @@ describe("TUI session bridge", () => {
     if (!turn || !stream) {
       throw new Error("Missing active turn");
     }
+    // Mobile publishes its unchanged composer settings before sending a steer.
+    await expect(
+      f.clients[1]?.request({
+        id: 2,
+        method: "thread/settings/update",
+        params: {
+          approvalPolicy: "never",
+          approvalsReviewer: "user",
+          cwd: f.home,
+          disabledPluginIds: [],
+          effort: "off",
+          model: "openai/gpt-4o",
+          sandboxPolicy: { type: "dangerFullAccess" },
+          serviceTier: null,
+          summary: "auto",
+          threadId: f.session.sessionId,
+        },
+      })
+    ).resolves.toStrictEqual({});
     await f.clients[1]?.request({
       id: 3,
       method: "turn/steer",
@@ -492,6 +531,289 @@ describe("TUI session bridge", () => {
         )
       ).toHaveLength(2);
     }
+  });
+
+  it("defers model changes until the next native prompt and persists the choice", async () => {
+    const f = await fixture(true);
+    const native = f.session.prompt("keep this model for the active turn");
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    const [first] = f.streams;
+    if (!first) {
+      throw new Error("Missing first stream");
+    }
+    await f.clients[0]?.request({
+      id: 1,
+      method: "thread/settings/update",
+      params: {
+        effort: "high",
+        model: "openai/o3",
+        threadId: f.session.sessionId,
+      },
+    });
+    expect(f.session.model?.id).toBe("gpt-4o");
+    complete(first, streamText(first, "first finished"));
+    await native;
+    if (!f.context) {
+      throw new Error("Missing native context");
+    }
+    // Reloading the owner loses its in-memory state, but keeps the Pi session branch.
+    await f.bridge?.start(f.context);
+    const next = f.session.prompt("use the updated defaults");
+    await vi.waitFor(() => expect(f.streams).toHaveLength(2));
+    expect(f.session.model?.id).toBe("o3");
+    expect(f.session.thinkingLevel).toBe("high");
+    const [, second] = f.streams;
+    if (!second) {
+      throw new Error("Missing second stream");
+    }
+    const secondResponse = streamText(second, "second finished");
+    secondResponse.model = "o3";
+    complete(second, secondResponse);
+    await next;
+    const { sessionFile } = f.session;
+    if (!sessionFile) {
+      throw new Error("Missing persisted session");
+    }
+    const restored = SessionManager.open(sessionFile);
+    expect(restored.buildSessionContext()).toMatchObject({
+      model: { modelId: "o3", provider: "openai" },
+      thinkingLevel: "high",
+    });
+  });
+
+  it("rejects unsupported settings before changing the model", async () => {
+    const f = await fixture();
+    await expect(
+      f.clients[0]?.request({
+        id: 1,
+        method: "thread/settings/update",
+        params: {
+          approvalPolicy: "on-request",
+          model: "openai/o3",
+          threadId: f.session.sessionId,
+        },
+      })
+    ).rejects.toThrow(/approvalPolicy/u);
+    expect(f.session.model?.id).toBe("gpt-4o");
+    await expect(
+      f.clients[0]?.request({
+        id: 2,
+        method: "thread/settings/update",
+        params: {
+          cwd: path.join(f.home, "other"),
+          threadId: f.session.sessionId,
+        },
+      })
+    ).rejects.toThrow(/new.*thread|new.*session/iu);
+  });
+
+  it("does not let unchanged steer settings override a later local model selection", async () => {
+    const f = await fixture();
+    const firstRun = f.session.prompt("first");
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    await f.clients[0]?.request({
+      id: 1,
+      method: "thread/settings/update",
+      params: {
+        effort: "off",
+        model: "openai/gpt-4o",
+        threadId: f.session.sessionId,
+      },
+    });
+    const [first] = f.streams;
+    if (!first) {
+      throw new Error("Missing first stream");
+    }
+    complete(first, streamText(first, "finished"));
+    await firstRun;
+    const model = f.context?.modelRegistry.find("openai", "o3");
+    if (!model) {
+      throw new Error("Missing next model");
+    }
+    await f.session.setModel(model);
+    const next = f.session.prompt("native model selection wins");
+    await vi.waitFor(() => expect(f.streams).toHaveLength(2));
+    expect(f.session.model?.id).toBe("o3");
+    const [, second] = f.streams;
+    if (!second) {
+      throw new Error("Missing next stream");
+    }
+    complete(second, streamText(second, "finished"));
+    await next;
+  });
+
+  it("asks old TUI owners to reload without sending an uncertain settings command", async () => {
+    const f = await fixture();
+    const descriptorFile = `${ownerPath(f.home, f.session.sessionId)}.json`;
+    const descriptor = descriptorSchema.parse(
+      JSON.parse(await readFile(descriptorFile, "utf-8"))
+    );
+    await writeFile(
+      descriptorFile,
+      JSON.stringify({ ...descriptor, protocolVersion: 2 }),
+      { mode: 0o600 }
+    );
+    const client = await SessionOwnerClient.connect(
+      f.home,
+      f.session.sessionId,
+      () => {},
+      () => {}
+    );
+    if (!client) {
+      throw new Error("Missing legacy client");
+    }
+    try {
+      await expect(
+        client.request({
+          id: 1,
+          method: "thread/settings/update",
+          params: { model: "openai/o3", threadId: f.session.sessionId },
+        })
+      ).rejects.toThrow(/reload/u);
+      expect(f.session.model?.id).toBe("gpt-4o");
+    } finally {
+      client.close();
+    }
+  });
+
+  it("holds native input while an idle remote model update is awaiting authentication", async () => {
+    const f = await fixture();
+    const authStarted = Promise.withResolvers<undefined>();
+    const authReleased = Promise.withResolvers<undefined>();
+    const checkAuth = f.modelRuntime.checkAuth.bind(f.modelRuntime);
+    const check = vi
+      .spyOn(f.modelRuntime, "checkAuth")
+      .mockImplementation(async (...args) => {
+        authStarted.resolve();
+        await authReleased.promise;
+        return await checkAuth(...args);
+      });
+    const settings = f.clients[0]?.request({
+      id: 1,
+      method: "thread/settings/update",
+      params: {
+        effort: "high",
+        model: "openai/o3",
+        threadId: f.session.sessionId,
+      },
+    });
+    await authStarted.promise;
+    let settled = false;
+    const native = f.session
+      .prompt("native input while settings are pending")
+      .finally(() => {
+        settled = true;
+      });
+    try {
+      await vi.waitFor(() =>
+        expect(settled || f.streams.length > 0).toBeTruthy()
+      );
+      expect(f.streams).toHaveLength(0);
+    } finally {
+      authReleased.resolve();
+      await settings;
+      check.mockRestore();
+      await f.session.abort();
+      await native;
+    }
+    expect(f.session.model?.id).toBe("o3");
+    expect(f.session.thinkingLevel).toBe("high");
+  });
+
+  it("waits at the inference boundary after a later asynchronous input handler", async () => {
+    const inputEntered = Promise.withResolvers<undefined>();
+    const inputReleased = Promise.withResolvers<undefined>();
+    const f = await fixture(false, async () => {
+      inputEntered.resolve();
+      await inputReleased.promise;
+    });
+    const native = f.session.prompt(
+      "native prompt admitted before the remote update"
+    );
+    await inputEntered.promise;
+    const authEntered = Promise.withResolvers<undefined>();
+    const authReleased = Promise.withResolvers<undefined>();
+    const checkAuth = f.modelRuntime.checkAuth.bind(f.modelRuntime);
+    const check = vi
+      .spyOn(f.modelRuntime, "checkAuth")
+      .mockImplementation(async (...args) => {
+        authEntered.resolve();
+        await authReleased.promise;
+        return await checkAuth(...args);
+      });
+    const settings = f.clients[0]?.request({
+      id: 1,
+      method: "thread/settings/update",
+      params: {
+        effort: "high",
+        model: "openai/o3",
+        threadId: f.session.sessionId,
+      },
+    });
+    await authEntered.promise;
+    inputReleased.resolve();
+    try {
+      await vi.waitFor(() => expect(f.session.isStreaming).toBeTruthy());
+      await nextTick();
+      expect(f.streams).toHaveLength(0);
+    } finally {
+      authReleased.resolve();
+      await settings;
+      check.mockRestore();
+      await f.session.abort();
+      await native;
+    }
+  });
+
+  it("drains native settings preparation before releasing the writer on stop", async () => {
+    const f = await fixture();
+    const first = f.session.prompt("first");
+    await vi.waitFor(() => expect(f.streams).toHaveLength(1));
+    await f.clients[0]?.request({
+      id: 1,
+      method: "thread/settings/update",
+      params: {
+        effort: "high",
+        model: "openai/o3",
+        threadId: f.session.sessionId,
+      },
+    });
+    const [stream] = f.streams;
+    if (!stream) {
+      throw new Error("Missing stream");
+    }
+    complete(stream, streamText(stream, "first finished"));
+    await first;
+    const authEntered = Promise.withResolvers<undefined>();
+    const authReleased = Promise.withResolvers<undefined>();
+    const checkAuth = f.modelRuntime.checkAuth.bind(f.modelRuntime);
+    const check = vi
+      .spyOn(f.modelRuntime, "checkAuth")
+      .mockImplementation(async (...args) => {
+        authEntered.resolve();
+        await authReleased.promise;
+        return await checkAuth(...args);
+      });
+    const next = f.session.prompt("do not start after the owner stops");
+    await authEntered.promise;
+    const stopping = f.bridge?.stop();
+    try {
+      const outcome = await Promise.race([
+        stopping?.then(() => "stopped"),
+        delay(100, "waiting"),
+      ]);
+      expect(outcome).toBe("waiting");
+      await expect(
+        acquireSessionLease(f.home, f.session.sessionId)
+      ).rejects.toHaveProperty("code", "ELOCKED");
+    } finally {
+      authReleased.resolve();
+      await stopping;
+      check.mockRestore();
+      await f.session.abort();
+      await next;
+    }
+    expect(f.streams).toHaveLength(1);
   });
 
   it("admits only one simultaneous remote prompt", async () => {

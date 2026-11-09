@@ -16,6 +16,12 @@ Use Node 24+ and Bun 1.4.3. In Pi, run `/login` → `openai-codex`, then `/codex
 
 The new command paths were exercised on macOS with a native Pi 1.5.0 TUI and the pinned 1.2.0 standalone SDK. Automated tests cover streaming, directory execution, PTY size changes, backpressure, termination, and disconnect cleanup. Android UI and Windows/Linux PTY behavior have not been manually verified. A terminal's `closeStdin` sends its EOF character; raw-mode programs should be terminated explicitly.
 
+Mobile steering supports the `thread/settings/update` request sent before `turn/steer`. Model and reasoning changes apply immediately when idle, or persist in Pi history for the next turn while work is running. Repeating unchanged composer settings preserves later local model selections. Native TUI owners need this fork's updated extension and an idle `/reload` to handle settings updates. Unsupported permission, sandbox, service-tier and collaboration changes are rejected explicitly. Changing an existing thread's working directory requires a new session.
+
+When upgrading an existing checkout, rebuild it and update both the daemon and TUI extension: while idle, run `/codex-server stop`, `/reload`, then `/codex-server start` in Pi. Keep the existing server home to preserve pairing. Settings updates follow the current session publication policy; sessions disabled by global or local export settings cannot be updated through Remote.
+
+`thread/backgroundTerminals/list` returns an empty list because Pi does not expose a Codex detached-terminal registry. Pi bash calls remain live turn tools; standalone `command/exec` processes are scoped to their connection.
+
 The documentation below retains the AdamsGH fork's background and distribution details. Commands installing `npm:@pi-switch/pi-codex-app-server` install that fork, rather than this source fork.
 
 ---

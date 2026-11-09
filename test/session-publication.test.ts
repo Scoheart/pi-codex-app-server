@@ -375,6 +375,118 @@ describe("Session publication", () => {
     }
   });
 
+  test.each(["global", "local"] as const)(
+    "settings updates respect changes to %s publication policy",
+    async (scope) => {
+      const f = await fixture();
+      const session = f.session("settings-thread");
+      await writeFile(
+        session.path,
+        JSON.stringify({
+          cwd: f.cwd,
+          id: session.id,
+          timestamp: new Date(0).toISOString(),
+          type: "session",
+          version: 3,
+        })
+      );
+      await f.settings({ unassigned: { mode: "all" } });
+      const list = vi
+        .spyOn(PiSessionRepository.prototype, "list")
+        .mockResolvedValue([session]);
+      // Replace only execution: publication and RPC validation use their real implementations.
+      const update = vi
+        .spyOn(PiLiveSessionManager.prototype, "updateSettings")
+        .mockResolvedValue();
+      const server = await createAppServer({
+        autoStart: false,
+        hostName: "test",
+        listenUrl: new URL("ws://127.0.0.1:0"),
+        paths: {
+          database: path.join(f.home, "settings.sqlite"),
+          endpoint: path.join(f.home, "endpoint.json"),
+          home: f.home,
+          logs: f.home,
+        },
+        piAgentDir: f.home,
+        remoteControl: {
+          baseUrl: new URL("https://chatgpt.com/backend-api/"),
+          enabled: false,
+        },
+      });
+      server.database.upsertThread({
+        archived: false,
+        projectId: null,
+        sessionFile: session.path,
+        threadId: session.id,
+        updatedAt: 0,
+      });
+      const responses: CodexWireMessage[] = [];
+      const local = scope === "local";
+      const connection = new JsonRpcConnection({
+        clientId: "settings-publication",
+        logger: appServerLogger,
+        transport: {
+          close: () => {},
+          read: async function* read() {
+            yield* initializeClient();
+            yield JSON.stringify({
+              id: 1,
+              method: "thread/settings/update",
+              params: { effort: "off", threadId: session.id },
+            });
+            await f.settings({ unassigned: { mode: "off" } }, local);
+            yield JSON.stringify({
+              id: 2,
+              method: "thread/read",
+              params: { threadId: session.id },
+            });
+            yield JSON.stringify({
+              id: 3,
+              method: "thread/settings/update",
+              params: { effort: "off", threadId: session.id },
+            });
+            await f.settings({ unassigned: { mode: "all" } }, local);
+            yield JSON.stringify({
+              id: 4,
+              method: "thread/settings/update",
+              params: { effort: "off", threadId: session.id },
+            });
+            yield JSON.stringify({
+              id: 5,
+              method: "thread/settings/update",
+              params: { effort: "off", threadId: "unknown-thread" },
+            });
+          },
+          send: (message) => {
+            responses.push(parseCodexWireMessage(message));
+            return Promise.resolve();
+          },
+        },
+      });
+      try {
+        server.register(connection);
+        await connection.run();
+        expect(responses).toContainEqual({ id: 1, result: {} });
+        expect(responses).toContainEqual({ id: 4, result: {} });
+        for (const id of [2, 3, 5]) {
+          expect(responses).toContainEqual({
+            error: {
+              code: expect.any(Number),
+              message: expect.stringContaining("Thread not found"),
+            },
+            id,
+          });
+        }
+      } finally {
+        server.close();
+        update.mockRestore();
+        list.mockRestore();
+        await f.close();
+      }
+    }
+  );
+
   test("off blocks starting new sessions and project policy is independent", async () => {
     const f = await fixture();
     try {

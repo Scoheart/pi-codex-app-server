@@ -17,7 +17,9 @@ export const ownerPath = (home: string, threadId: string): string =>
   );
 export const descriptorSchema = z.object({
   pid: z.number().int().positive(),
-  protocolVersion: z.union([z.literal(1), z.literal(2)]).default(1),
+  protocolVersion: z
+    .union([z.literal(1), z.literal(2), z.literal(3)])
+    .default(1),
   threadId: z.string(),
   token: z.string().uuid(),
   url: z.string().url(),
@@ -55,6 +57,7 @@ export type OwnerRequest = Extract<
       | "turn/steer"
       | "turn/interrupt"
       | "thread/compact/start"
+      | "thread/settings/update"
       | "thread/name/set";
   }
 >;

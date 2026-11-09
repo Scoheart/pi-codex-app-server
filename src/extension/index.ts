@@ -91,6 +91,9 @@ export default function piCodexAppServerExtension(pi: ExtensionAPI): void {
     await experience.handleSessionStart(toCodexServerContext(context, bridge));
   });
   pi.on("input", (event, context) => bridge.guardInput(event, context));
+  pi.on("before_agent_start", (_event, context) =>
+    bridge.beforeAgentStart(context)
+  );
   pi.on("session_tree", () => bridge.refresh());
   pi.on("session_compact", () => bridge.refresh());
   pi.on("session_info_changed", () => bridge.nameChanged());
