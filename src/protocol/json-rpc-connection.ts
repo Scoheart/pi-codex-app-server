@@ -84,6 +84,7 @@ export class JsonRpcConnection {
   readonly #pendingServerRequests = new Map<string | number, ServerMethod>();
   readonly #peer: CodexJsonRpcPeer;
   readonly #transport: MessageTransport;
+  readonly #deferredRequests = new Set<Promise<void>>();
   #initialized = false;
   #optOutNotificationMethods = new Set<string>();
 
@@ -164,6 +165,7 @@ export class JsonRpcConnection {
       throw failure;
     } finally {
       this.close();
+      await Promise.allSettled(this.#deferredRequests);
     }
   }
 
@@ -256,11 +258,33 @@ export class JsonRpcConnection {
       throw error;
     }
 
-    await this.#peer.receiveAndSend(
+    const response = this.#peer.receiveAndSend(
       addJsonRpcVersion(message),
       this.#context,
       this.#context
     );
+    if (
+      message.method === "command/exec" ||
+      message.method === "command/exec/write"
+    ) {
+      // Process exit and backpressured stdin must not block control or disconnect handling.
+      this.#deferredRequests.add(response);
+      void this.#finishDeferredRequest(response);
+    } else {
+      await response;
+    }
+  }
+
+  async #finishDeferredRequest(response: Promise<void>): Promise<void> {
+    try {
+      await response;
+    } catch (error) {
+      this.#logger.error(
+        error instanceof Error ? error : new Error("Deferred command failed")
+      );
+    } finally {
+      this.#deferredRequests.delete(response);
+    }
   }
 
   #registerCompatibilityFallback<Method extends ClientMethod>(

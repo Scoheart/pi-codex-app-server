@@ -1,6 +1,9 @@
 /* oxlint-disable anti-slop/no-module-mocking -- Enrollment and auth are external I/O boundaries; this test exercises the real WebSocket relay against a local server. */
 
 import { once } from "node:events";
+import { createServer } from "node:http";
+import { connect } from "node:net";
+import type { Socket } from "node:net";
 
 import { getLogger } from "@logtape/logtape";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -212,6 +215,122 @@ describe("Remote Control relay lifecycle", () => {
     vi.clearAllMocks();
     vi.restoreAllMocks();
   });
+
+  it("cancels proxy CONNECT sockets when the relay closes before the handshake", async () => {
+    const proxy = createServer();
+    const sockets = new Set<Socket>();
+    let connected = false;
+    proxy.on("connection", (socket) => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
+    proxy.on("connect", (_request, socket) => {
+      connected = true;
+      // A CONNECT proxy releases its half-open side when the client aborts.
+      socket.on("end", () => socket.destroy());
+      socket.resume();
+    });
+    proxy.listen(0, "127.0.0.1");
+    await once(proxy, "listening");
+    const { port } = addressSchema.parse(proxy.address());
+    for (const key of [
+      "http_proxy",
+      "no_proxy",
+      "npm_config_proxy",
+      "npm_config_no_proxy",
+    ]) {
+      vi.stubEnv(key, "");
+      Reflect.deleteProperty(process.env, key);
+    }
+    vi.stubEnv("HTTP_PROXY", `http://127.0.0.1:${port}`);
+    vi.stubEnv("NO_PROXY", "");
+    remoteMocks.loadOrEnroll.mockResolvedValue({
+      accountId: "test",
+      appServerVersion: CODEX_APP_SERVER_COMPATIBILITY_VERSION,
+      environmentId: "test",
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      remoteControlToken: "test",
+      serverId: "test",
+      serverName: "test",
+      websocketUrl: "ws://127.0.0.1:9/",
+    });
+    const relay = new RemoteControlRelay({
+      config: makeConfig(),
+      logger,
+      server: makeTestServer(),
+    });
+    relays.push(relay);
+    const run = relay.run();
+    runs.push(run);
+    try {
+      await vi.waitFor(() => expect(connected).toBeTruthy());
+      relay.close();
+      await run;
+      await vi.waitFor(() => expect(sockets.size).toBe(0));
+    } finally {
+      relay.close();
+      for (const socket of sockets) {
+        socket.destroy();
+      }
+      const closed = once(proxy, "close");
+      proxy.close();
+      await closed;
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it.each([false, true])(
+    "routes through an HTTP proxy unless NO_PROXY bypasses it (%s)",
+    async (bypass) => {
+      const proxy = createServer();
+      let tunnels = 0;
+      proxy.on("connect", (request, socket, head) => {
+        tunnels += 1;
+        const address = new URL(`http://${request.url}`);
+        const upstream = connect(Number(address.port), address.hostname, () => {
+          socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+          if (head.length) {
+            upstream.write(head);
+          }
+          socket.pipe(upstream).pipe(socket);
+        });
+        socket.on("error", () => upstream.destroy());
+        upstream.on("error", () => socket.destroy());
+        socket.on("close", () => upstream.destroy());
+      });
+      proxy.listen(0, "127.0.0.1");
+      await once(proxy, "listening");
+      const { port } = addressSchema.parse(proxy.address());
+      for (const key of [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
+        "npm_config_proxy",
+        "npm_config_no_proxy",
+      ]) {
+        vi.stubEnv(key, "");
+        Reflect.deleteProperty(process.env, key);
+      }
+      vi.stubEnv("HTTP_PROXY", `http://127.0.0.1:${port}`);
+      vi.stubEnv("NO_PROXY", bypass ? "127.0.0.1" : "");
+      try {
+        const { relay } = await startRelay();
+        expect(tunnels).toBe(bypass ? 0 : 1);
+        relay.close();
+        await Promise.all(runs);
+      } finally {
+        for (const relay of relays) {
+          relay.close();
+        }
+        await Promise.all(runs);
+        const closed = once(proxy, "close");
+        proxy.close();
+        await closed;
+        vi.unstubAllEnvs();
+      }
+    }
+  );
 
   it("requires initialize for a stream and keeps server sequence continuity across reinitialize", async () => {
     const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0 (unreleased source fork)
+
+- Add the mobile folder picker command protocol: buffered/streamed output, stdin, PTY sizing, resize and termination.
+- Keep backpressured commands interruptible, preserve stdin close ordering, and clean up POSIX process groups after disconnects or timeouts.
+- Sanitize process-start errors so command arguments do not enter diagnostics.
+- Honor proxy environment variables for standalone HTTP requests and relay WebSockets, including NO_PROXY bypass.
+- Retain upstream attribution and mark the package private; this source fork is not published to npm.
+
 ## 0.2.1 (2026-10-23)
 
 - Fix the extension exiting native Pi when `pi -c` opens a session whose app-server lease is already held by another window.

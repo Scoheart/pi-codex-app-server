@@ -1,4 +1,24 @@
-# Pi Codex App Server
+# Pi Codex App Server — Scoheart fork
+
+This public source fork builds on [AdamsGH/pi-codex-app-server](https://github.com/AdamsGH/pi-codex-app-server), which builds on [Lqm1/pi-codex-app-server](https://github.com/Lqm1/pi-codex-app-server). It adds the host command protocol used by the ChatGPT mobile folder picker, including streaming output, stdin, PTYs, resize/terminate, and cleanup on timeout or disconnect. HTTP enrollment and the WebSocket relay honor proxy environment variables, including `NO_PROXY`.
+
+This fork is distributed from source. It is **not published to npm**; the package is marked private to prevent publishing under the upstream npm scope. Install this fork with:
+
+```sh
+git clone https://github.com/Scoheart/pi-codex-app-server.git
+cd pi-codex-app-server
+bun install --frozen-lockfile
+bun run build
+pi install "$PWD"
+```
+
+Use Node 24+ and Bun 1.4.3. In Pi, run `/login` → `openai-codex`, then `/codex-server pair`. If a proxy is required, set `HTTPS_PROXY` and `HTTP_PROXY` before starting Pi; loopback services can be excluded with `NO_PROXY=localhost,127.0.0.1`. No proxy address, credential, host enrollment or personal session is bundled. Existing ChatGPT pairing still uses the computer's Pi OAuth account; available models use Pi's own provider logins.
+
+The new command paths were exercised on macOS with a native Pi 1.5.0 TUI and the pinned 1.2.0 standalone SDK. Automated tests cover streaming, directory execution, PTY size changes, backpressure, termination, and disconnect cleanup. Android UI and Windows/Linux PTY behavior have not been manually verified. A terminal's `closeStdin` sends its EOF character; raw-mode programs should be terminated explicitly.
+
+The documentation below retains the AdamsGH fork's background and distribution details. Commands installing `npm:@pi-switch/pi-codex-app-server` install that fork, rather than this source fork.
+
+---
 
 Use the same Pi session from the Pi terminal and Codex clients. Pi executes the work; this bridge exposes history, live events, models, and host operations through the Codex app-server protocol.
 

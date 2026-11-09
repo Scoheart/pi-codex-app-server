@@ -9,3 +9,7 @@ vendor/openai-codex-app-server-protocol/protocol-snapshot.json.
 Upstream notices in generated files are preserved.
 
 The repository retains the upstream Apache License 2.0 in LICENSE.
+
+Additional modifications in this source fork are maintained at
+https://github.com/Scoheart/pi-codex-app-server.
+The AdamsGH and Lqm1 upstream notices and history are retained.

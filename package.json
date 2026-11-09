@@ -1,6 +1,7 @@
 {
   "name": "@pi-switch/pi-codex-app-server",
-  "version": "0.2.1",
+  "version": "0.3.0",
+  "private": true,
   "description": "Expose Pi Coding Agent through the Codex App Server and ChatGPT Remote protocols.",
   "keywords": [
     "app-server",
@@ -9,14 +10,14 @@
     "pi-coding-agent",
     "pi-package"
   ],
-  "homepage": "https://github.com/AdamsGH/pi-codex-app-server#readme",
+  "homepage": "https://github.com/Scoheart/pi-codex-app-server#readme",
   "bugs": {
-    "url": "https://github.com/AdamsGH/pi-codex-app-server/issues"
+    "url": "https://github.com/Scoheart/pi-codex-app-server/issues"
   },
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AdamsGH/pi-codex-app-server.git"
+    "url": "git+https://github.com/Scoheart/pi-codex-app-server.git"
   },
   "bin": {
     "pi-codex-app-server": "./dist/cli.js"
@@ -67,9 +68,13 @@
     "commander": "^15.0.0",
     "drizzle-orm": "1.0.0-rc.4",
     "es-toolkit": "^1.39.10",
+    "https-proxy-agent": "9.1.0",
     "json-rpc-2.0": "^1.7.1",
+    "node-pty": "1.1.0",
     "proper-lockfile": "^4.1.2",
+    "proxy-from-env": "2.1.0",
     "qrcode": "^1.5.4",
+    "undici": "8.7.0",
     "ws": "^8.18.3",
     "zod": "^4.4.3"
   },
@@ -85,6 +90,7 @@
     "@types/bun": "^1.2.21",
     "@types/node": "^24.3.0",
     "@types/proper-lockfile": "^4.1.4",
+    "@types/proxy-from-env": "1.0.3",
     "@types/qrcode": "^1.5.6",
     "@types/ws": "^8.18.1",
     "drizzle-kit": "1.0.0-rc.4",
@@ -125,5 +131,8 @@
     "extensions": [
       "./src/extension/index.ts"
     ]
-  }
+  },
+  "trustedDependencies": [
+    "node-pty"
+  ]
 }

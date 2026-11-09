@@ -9,6 +9,10 @@ bun install --frozen-lockfile
 bun run verify
 ```
 
+If verification is launched from an agent that sets `PI_OFFLINE=1`, unset that variable for the checks: one skills diagnostic test deliberately exercises the missing-package callback (which returns skip without installing). On macOS, use a short temporary path such as `TMPDIR=/tmp` for Unix socket fixtures.
+
+`node-pty` is the only allowlisted dependency install hook. Linux installations need Python 3 and C/C++ build tools to compile it; Windows and macOS use its packaged native builds. A clean package installed with scripts disabled can load non-PTY features; PTY commands require a working native dependency.
+
 If the system Bun cannot parse the lockfile:
 
 ```sh

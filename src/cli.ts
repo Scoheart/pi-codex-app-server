@@ -8,12 +8,14 @@ import {
 import type { AppServerConfig } from "./config/app-server-config.js";
 import { configureAppServerLogging } from "./logging/app-server-logger.js";
 import { startRemoteControlPairing } from "./remote/pairing.js";
+import { initializeHttpNetworking } from "./remote/proxy-network.js";
 import { runDaemon } from "./server/run-daemon.js";
 import { runStdioAppServer } from "./server/run-stdio.js";
 
 const runWithConfig = async (
   action: (config: AppServerConfig) => Promise<void>
 ): Promise<void> => {
+  initializeHttpNetworking();
   await configureAppServerLogging();
   const config = loadConfig();
   await ensureAppServerDirectories(config);

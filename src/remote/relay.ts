@@ -14,6 +14,7 @@ import { WebSocketTransport } from "../transports/websocket-transport.js";
 import { RemoteClientTransport } from "./client-transport.js";
 import { getOrCreateInstallationId, loadOrEnroll } from "./enrollment.js";
 import type { RemoteControlEnrollment } from "./enrollment.js";
+import { relayProxyAgent } from "./proxy-network.js";
 import { loadRemoteControlAuth } from "./remote-control-auth.js";
 import { resolveRemoteControlEndpoints } from "./remote-control-endpoints.js";
 
@@ -227,7 +228,16 @@ export class RemoteControlRelay {
       });
     }
 
-    const socket = new WebSocket(enrollment.websocketUrl, { headers });
+    const proxyController = new AbortController();
+    const agent = relayProxyAgent(
+      enrollment.websocketUrl,
+      proxyController.signal
+    );
+    const socket = new WebSocket(enrollment.websocketUrl, { agent, headers });
+    socket.once("close", () => {
+      proxyController.abort();
+      agent?.destroy();
+    });
     let lastPongAt = Date.now();
     const healthTimer = setInterval(() => {
       if (socket.readyState !== WebSocket.OPEN) {

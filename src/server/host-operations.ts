@@ -16,6 +16,7 @@ import path from "node:path";
 
 import { appServerLogger } from "../logging/app-server-logger.js";
 import type { JsonRpcConnection } from "../protocol/json-rpc-connection.js";
+import { registerCommandExec } from "./command-exec.js";
 
 interface ProcessOutput {
   buffers: Buffer[];
@@ -36,6 +37,7 @@ const absolutePath = (value: string): string => {
 };
 
 export const registerHostOperations = (connection: JsonRpcConnection): void => {
+  registerCommandExec(connection);
   const processes = new Map<string, ChildProcessWithoutNullStreams>();
   const watches = new Map<string, FSWatcher>();
   let watchingConnection = false;
